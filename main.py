@@ -1,0 +1,140 @@
+from flask import Flask, render_template, request, redirect, session, url_for
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_sqlalchemy import SQLAlchemy
+from authlib.integrations.flask_client import OAuth
+from api_key import *
+
+app = Flask(__name__)
+app.secret_key = 'your_secret_key'
+
+# Database setup
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+oauth = OAuth(app)
+
+google = oauth.register(
+    name='google',
+    client_id=CLIENT_ID,
+    client_secret=CLIENT_SECRET,
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={
+        'scope': 'openid email profile'
+    }
+)
+
+# Database Model
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(25), unique=True, nullable=False)
+    password = db.Column(db.String(255), nullable=True)
+
+    def set_password(self, password):
+        self.password = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password, password)
+
+
+# Home
+@app.route('/')
+def home():
+    if "username" in session:
+        return redirect(url_for('dashboard'))
+    return render_template('index.html')
+
+
+# Login
+@app.route('/login', methods=['POST'])
+def login():
+    username = request.form['username']
+    password = request.form['password']
+    user = User.query.filter_by(username=username).first()
+
+    if user and user.check_password(password):
+        session['username'] = username
+        return redirect(url_for('dashboard'))
+    else:
+        return render_template('index.html', error="Invalid Credentials")
+
+
+# Register
+@app.route('/register', methods=['POST'])
+def register():
+    username = request.form['username']
+    password = request.form['password']
+
+    user = User.query.filter_by(username=username).first()
+    if user:
+        return render_template('index.html', error="Username already exists")
+    else:
+        new_user = User(username=username)
+        new_user.set_password(password)
+        db.session.add(new_user)
+        db.session.commit()
+        session['username'] = username
+        return redirect(url_for('dashboard'))
+
+
+# Dashboard
+@app.route('/dashboard')
+def dashboard():
+    if "username" in session:
+        return render_template('dashboard.html', username=session['username'])
+    return redirect(url_for('home'))
+
+
+# Logout
+@app.route('/logout')
+def logout():
+    session.pop('username', None)
+    return redirect(url_for('home'))
+
+
+# Google login
+@app.route('/auth/google')
+def login_google():
+    try:
+        redirect_uri = url_for('authorize_google', _external=True)
+        return google.authorize_redirect(redirect_uri)
+    except Exception as e:
+        app.logger.error(f"Google OAuth error: {e}")
+        return "Error occurred during Google OAuth login.", 500
+
+
+# Google redirect handler
+@app.route('/authorize/google')
+def authorize_google():
+
+    # Get access token
+    token = google.authorize_access_token()
+
+    # Get Google metadata
+    metadata = google.load_server_metadata()
+    userinfo_endpoint = metadata.get("userinfo_endpoint")
+
+    # Fetch user info
+    resp = google.get(userinfo_endpoint)
+    user_info = resp.json()
+
+    username = user_info["email"]
+
+    # Register user if not exists
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        new_user = User(username=username)
+        new_user.set_password("oauth_default_password")
+        db.session.add(new_user)
+        db.session.commit()
+
+    session["username"] = username
+    session["oauth_token"] = token
+
+    return redirect(url_for("dashboard"))
+
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
